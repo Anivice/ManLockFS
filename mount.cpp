@@ -10,7 +10,6 @@
 #include <err.h>
 #include <fcntl.h>
 #include <unordered_map>
-#include "cppcrc.h"
 #include <sstream>
 #include <algorithm>
 #include <iostream>
