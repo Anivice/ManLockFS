@@ -165,7 +165,7 @@ static int fuse_do_readdir(const char *path,
     char buf [BUF_SIZE] = { };
     for (;;)
     {
-        const long nread = syscall(SYS_getdents, fd, buf, BUF_SIZE);
+        const long nread = syscall(SYS_getdents64, fd, buf, BUF_SIZE);
         if (nread == -1) {
             close(fd);
             return -errno;
