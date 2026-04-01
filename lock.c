@@ -20,22 +20,22 @@ struct lock_file_ioctl_msg_t {
 
 #define ML_LOCK_FILE      (1)
 #define ML_UNLOCK_FILE    (2)
-#define ML_APPEND_FILE    (3)
 
 #define min(a, b) (((a) < (b)) ? (a) : (b))
-const char * actions[] = { "lock", "unlock", "append" };
+const char * actions[] = { "lock", "unlock", };
 
 int main(int argc, char **argv)
 {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s <target file> <action:lock/unlock/append>\n", argv[0]);
+    if (argc != 4) {
+        fprintf(stderr, "usage: %s <controller> <target file> <action:lock/unlock>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    auto const target_file = argv[1];
-    auto const action = argv[2];
+    auto const controller = argv[1];
+    auto const target_file = argv[2];
+    auto const action = argv[3];
 
-    const int fd = open(target_file, O_RDONLY | O_CREAT);
+    const int fd = open(controller, O_RDONLY);
     if (fd == -1) {
         perror("open");
         return EXIT_FAILURE;
@@ -60,12 +60,6 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    struct stat stbuf = {};
-    if (fstat(fd, &stbuf) == -1) {
-        perror("fstat");
-        return EXIT_FAILURE;
-    }
-
     switch (action_determined)
     {
         case 0: // lock
@@ -73,20 +67,6 @@ int main(int argc, char **argv)
         {
             strncpy(irq.lock_path, abs_path, sizeof(irq.lock_path));
             irq.lock_action = (action_determined == 0 ? ML_LOCK_FILE : ML_UNLOCK_FILE);
-            irq.locker_ino = stbuf.st_ino;
-            if (ioctl(fd, MLFS_LOCK, &irq) == -1) {
-                perror("ioctl");
-                return EXIT_FAILURE;
-            }
-        }
-            break;
-
-        case 2: // append
-        {
-            strncpy(irq.lock_path, abs_path, sizeof(irq.lock_path));
-            irq.locker_ino = stbuf.st_ino;
-            irq.lock_action = ML_APPEND_FILE;
-            irq.content_length = read(STDIN_FILENO, irq.content_data, sizeof(irq.content_data));
             if (ioctl(fd, MLFS_LOCK, &irq) == -1) {
                 perror("ioctl");
                 return EXIT_FAILURE;

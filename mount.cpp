@@ -33,14 +33,9 @@ struct lock_file_ioctl_msg_t {
 
 #define ML_LOCK_FILE      (1)
 #define ML_UNLOCK_FILE    (2)
-#define ML_APPEND_FILE    (3)
 
 std::string g_lock_fs_prefix;
 std::string g_lock_fs_mount_point;
-struct fd_status_t {
-    int fd;
-};
-
 struct fd_lock_state_t {
     int lock_state;
 };
@@ -322,9 +317,6 @@ static int fuse_do_ioctl(const char *, const unsigned int cmd, void *,
             } else if (msg->lock_action == ML_UNLOCK_FILE) {
                 unlock_by_checksum(stbuf.st_ino);
                 return 0;
-            } else if (msg->lock_action == ML_APPEND_FILE) {
-                const auto n = std::min(msg->content_length, static_cast<uint64_t>(sizeof(msg->content_data)));
-                return write(fd, msg->content_data, n) != n;
             }
         }
         ERROR_RPT
