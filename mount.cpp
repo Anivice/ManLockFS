@@ -21,21 +21,22 @@
 #include <filesystem>
 namespace fs = std::filesystem;
 
-extern "C" struct lock_file_ioctl_msg {
+struct lock_file_ioctl_msg_t {
     uint64_t lock_action;
-    uint64_t locker_pid;
+    uint64_t locker_ino;
     uint64_t content_length;
     char lock_path[256];
     char content_data[512];
 };
 
-#define MLFS_LOCK   _IOW('M', 0x42, struct lock_file_ioctl_msg)
+#define MLFS_LOCK   _IOW('M', 0x42, struct lock_file_ioctl_msg_t)
 
 #define ML_LOCK_FILE      (1)
 #define ML_UNLOCK_FILE    (2)
 #define ML_APPEND_FILE    (3)
 
 std::string g_lock_fs_prefix;
+std::string g_lock_fs_mount_point;
 struct fd_status_t {
     int fd;
 };
@@ -43,9 +44,7 @@ struct fd_status_t {
 struct fd_lock_state_t {
     int lock_state;
 };
-std::mutex g_fd_tree_mutex;
 std::mutex g_fd_lock_state_mutex;
-std::unordered_map < uint64_t /* path hash */, fd_status_t > g_fd_tree;
 std::unordered_map < uint64_t /* path hash */, fd_lock_state_t > g_fd_lock_state;
 std::condition_variable g_cond_var;
 
@@ -63,32 +62,17 @@ std::condition_variable g_cond_var;
         return (errno == 0 ? -EIO : -errno);                                            \
     }
 
-void try_lock_and_block_when_trying(const uint64_t checksum,
-    const bool do_i_lock)
+void try_lock_and_block_when_trying(uint64_t ino, bool do_i_lock)
 {
-    auto try_acquire_lock = [&]->bool
-    {
-        std::lock_guard lock(g_fd_lock_state_mutex);
-        if (const auto it = g_fd_lock_state.find(checksum);
-            it != g_fd_lock_state.end() && it->second.lock_state == ML_LOCK_FILE) {
-            return false;
-        }
+    std::unique_lock<std::mutex> lk(g_fd_lock_state_mutex);
+    g_cond_var.wait(lk, [&] {
+        const auto it = g_fd_lock_state.find(ino);
+        return it == g_fd_lock_state.end()
+            || it->second.lock_state != ML_LOCK_FILE;
+    });
 
-        if (do_i_lock) g_fd_lock_state[checksum] = {
-                .lock_state  = ML_LOCK_FILE,
-            };
-        return true;
-    };
-
-    while (!try_acquire_lock())
-    {
-        std::unique_lock<std::mutex> lock(g_fd_lock_state_mutex);
-        g_cond_var.wait(lock, [&]->bool
-        {
-            const auto it = g_fd_lock_state.find(checksum);
-            // exist and locked, or doesn't exist at all
-            return ((it != g_fd_lock_state.end() && it->second.lock_state == ML_LOCK_FILE) || it == g_fd_lock_state.end());
-        });
+    if (do_i_lock) {
+        g_fd_lock_state[ino] = { .lock_state = ML_LOCK_FILE };
     }
 }
 
@@ -99,22 +83,42 @@ void unlock_by_checksum(const uint64_t checksum)
     g_cond_var.notify_all();
 }
 
-inline void lock_file(const std::string & path, const bool do_i_lock = false)
+uint64_t get_ino(const std::string & path)
 {
-    try_lock_and_block_when_trying(
-        CRC64::ECMA::calc(reinterpret_cast<const uint8_t *>(path.c_str()), path.length()),
-        do_i_lock);
+    const int fd = open(path.c_str(), O_RDONLY);
+    AUTO_ASSERT(fd >= 0);
+    struct stat stbuf { };
+    AUTO_ASSERT(fstat(fd, &stbuf) == 0);
+    return stbuf.st_ino;
+}
+
+inline void lock_file(const std::string & path, const bool do_i_lock = false) {
+    try_lock_and_block_when_trying(get_ino(path), do_i_lock);
 }
 
 inline void unlock_file(const std::string & path) {
-    unlock_by_checksum(CRC64::ECMA::calc(reinterpret_cast<const uint8_t *>(path.c_str()), path.length()));
+    unlock_by_checksum(get_ino(path));
 }
 
-std::string path_calculator(const std::string &path) noexcept
+std::string replace_all(
+    std::string & original,
+    const std::string & target,
+    const std::string & replacement) noexcept
 {
-    const fs::path p {path};
-    const fs::path n = p.lexically_normal();
-    return n.generic_string();
+    if (target.empty()) return original; // Avoid infinite loop if target is empty
+
+    if (target.size() == 1 && replacement.empty()) {
+        std::erase_if(original, [&target](const char c) { return c == target[0]; });
+        return original;
+    }
+
+    size_t pos = 0;
+    while ((pos = original.find(target, pos)) != std::string::npos) {
+        original.replace(pos, target.length(), replacement);
+        pos += replacement.length(); // Move past the replacement to avoid infinite loop
+    }
+
+    return original;
 }
 
 static int fuse_do_getattr(const char *path, struct stat *stbuf, fuse_file_info *)
@@ -202,37 +206,8 @@ static int fuse_do_create(const char *path, const mode_t mode, fuse_file_info *)
     return 0;
 }
 
-static int fuse_do_flush(const char * path, fuse_file_info *)
+static int fuse_do_flush(const char *, fuse_file_info *)
 {
-    std::string prefix(g_lock_fs_prefix);
-    prefix += path;
-
-    {
-        const uint64_t path_crc64 = CRC64::ECMA::calc(reinterpret_cast<const uint8_t *>(prefix.c_str()), prefix.length());
-        std::lock_guard<std::mutex> lock(g_fd_tree_mutex);
-        if (const auto it = g_fd_tree.find(path_crc64); it != g_fd_tree.end()) {
-            return fsync(it->second.fd);
-        }
-    }
-
-    return 0;
-}
-
-static int fuse_do_release(const char *path, fuse_file_info *)
-{
-    std::string prefix(g_lock_fs_prefix);
-    prefix += path;
-
-    {
-        const uint64_t path_crc64 = CRC64::ECMA::calc(reinterpret_cast<const uint8_t *>(prefix.c_str()), prefix.length());
-        std::lock_guard<std::mutex> lock(g_fd_tree_mutex);
-        if (const auto it = g_fd_tree.find(path_crc64); it != g_fd_tree.end()) {
-            const int fd = it->second.fd;
-            g_fd_tree.erase(it);
-            return close(fd);
-        }
-    }
-
     return 0;
 }
 
@@ -240,61 +215,39 @@ static int fuse_do_access(const char *path, const int mode)
 {
     std::string prefix(g_lock_fs_prefix);
     prefix += path;
-    int status = access(prefix.c_str(), mode);
-    return status;
+    return access(prefix.c_str(), mode);
 }
 
-static int fuse_do_open(const char *path, fuse_file_info * info)
+static int fuse_do_open(const char *path, fuse_file_info *fi)
 {
-    std::string prefix(g_lock_fs_prefix);
-    prefix += path;
-    lock_file(prefix);
-
-    const uint64_t path_crc64 = CRC64::ECMA::calc(reinterpret_cast<const uint8_t *>(prefix.c_str()), prefix.length());
-    std::lock_guard<std::mutex> lock(g_fd_tree_mutex);
-    if (const auto it = g_fd_tree.find(path_crc64); it == g_fd_tree.end()) {
-        if (const auto fd = open(prefix.c_str(), info->flags); fd > 0) {
-            g_fd_tree[path_crc64] = { .fd = fd };
-            return 0;
-        }
-
-        return (errno == 0 ? -EIO : -errno);
-    }
-
+    const std::string real = g_lock_fs_prefix + path;
+    const int fd = open(real.c_str(), fi->flags);
+    if (fd == -1) return -errno;
+    fi->fh = static_cast<uint64_t>(fd);
     return 0;
 }
 
-static int fuse_do_read(const char *path, char *buffer, const size_t size, const off_t offset, fuse_file_info *)
+static int fuse_do_read(const char *path, char *buf, size_t size, off_t off, fuse_file_info *fi)
 {
-    std::string prefix(g_lock_fs_prefix);
-    prefix += path;
-    lock_file(prefix);
-
-    try {
-        const uint64_t path_crc64 = CRC64::ECMA::calc(reinterpret_cast<const uint8_t *>(prefix.c_str()), prefix.length());
-        std::lock_guard<std::mutex> lock(g_fd_tree_mutex);
-        const auto fd = g_fd_tree.at(path_crc64).fd;
-        AUTO_ASSERT(lseek(fd, offset, SEEK_SET) == 0);
-        return static_cast<int>(read(fd, buffer, size));
-    }
-    ERROR_RPT
+    const std::string real = g_lock_fs_prefix + path;
+    lock_file(real);
+    const int fd = static_cast<int>(fi->fh);
+    const ssize_t n = pread(fd, buf, size, off);
+    return n == -1 ? -errno : static_cast<int>(n);
 }
 
-static int fuse_do_write(const char *path, const char *buffer, const size_t size, const off_t offset,
-                         fuse_file_info *)
+static int fuse_do_write(const char *path, const char *buf, size_t size, off_t off, fuse_file_info *fi)
 {
-    std::string prefix(g_lock_fs_prefix);
-    prefix += path;
-    lock_file(prefix);
+    const std::string real = g_lock_fs_prefix + path;
+    lock_file(real);
+    const int fd = static_cast<int>(fi->fh);
+    const ssize_t n = pwrite(fd, buf, size, off);
+    return n == -1 ? -errno : static_cast<int>(n);
+}
 
-    try {
-        const uint64_t path_crc64 = CRC64::ECMA::calc(reinterpret_cast<const uint8_t *>(prefix.c_str()), prefix.length());
-        std::lock_guard<std::mutex> lock(g_fd_tree_mutex);
-        const auto fd = g_fd_tree.at(path_crc64).fd;
-        AUTO_ASSERT(lseek(fd, offset, SEEK_SET) == 0);
-        return static_cast<int>(write(fd, buffer, size));
-    }
-    ERROR_RPT
+static int fuse_do_release(const char *, fuse_file_info *fi)
+{
+    return close(static_cast<int>(fi->fh)) == -1 ? -errno : 0;
 }
 
 static int fuse_do_utimens(const char *path, const timespec tv[2], fuse_file_info *fi)
@@ -302,16 +255,9 @@ static int fuse_do_utimens(const char *path, const timespec tv[2], fuse_file_inf
     std::string prefix(g_lock_fs_prefix);
     prefix += path;
     lock_file(prefix);
-
-    try {
-        fuse_file_info flag { .flags = O_RDWR };
-        fuse_do_open(path, &flag);
-        const uint64_t path_crc64 = CRC64::ECMA::calc(reinterpret_cast<const uint8_t *>(prefix.c_str()), prefix.length());
-        std::lock_guard<std::mutex> lock(g_fd_tree_mutex);
-        const auto fd = g_fd_tree.at(path_crc64).fd;
-        return futimens(fd, tv);
-    }
-    ERROR_RPT
+    const auto fd = open(prefix.c_str(), O_RDWR);
+    if (fd == -1) return -errno;
+    return futimens(fd, tv);
 }
 
 static int fuse_do_unlink(const char *path)
@@ -319,18 +265,7 @@ static int fuse_do_unlink(const char *path)
     std::string prefix(g_lock_fs_prefix);
     prefix += path;
     lock_file(prefix);
-
-    try {
-        const uint64_t path_crc64 = CRC64::ECMA::calc(reinterpret_cast<const uint8_t *>(prefix.c_str()), prefix.length());
-        std::lock_guard<std::mutex> lock(g_fd_tree_mutex);
-        if (const auto it = g_fd_tree.find(path_crc64); it != g_fd_tree.end()) {
-            close(it->second.fd);
-            g_fd_tree.erase(it);
-        }
-
-        return unlink(prefix.c_str());
-    }
-    ERROR_RPT
+    return unlink(prefix.c_str());
 }
 
 static int fuse_do_rmdir(const char *path)
@@ -340,20 +275,8 @@ static int fuse_do_rmdir(const char *path)
     return rmdir(prefix.c_str());
 }
 
-static int fuse_do_fsync(const char *path, int, fuse_file_info *)
-{
-    std::string prefix(g_lock_fs_prefix);
-    prefix += path;
-    try {
-        const uint64_t path_crc64 = CRC64::ECMA::calc(reinterpret_cast<const uint8_t *>(prefix.c_str()), prefix.length());
-        std::lock_guard<std::mutex> lock(g_fd_tree_mutex);
-        if (const auto it = g_fd_tree.find(path_crc64); it != g_fd_tree.end()) {
-            return fsync(it->second.fd);
-        }
-
-        return 0;
-    }
-    ERROR_RPT
+static int fuse_do_fsync(const char *, int, fuse_file_info *) {
+    return 0;
 }
 
 static int fuse_do_releasedir(const char *, fuse_file_info *) {
@@ -383,38 +306,28 @@ static int fuse_do_ioctl(const char *, const unsigned int cmd, void *,
 {
     if (cmd == MLFS_LOCK)
     {
-        const auto *msg = static_cast<lock_file_ioctl_msg *>(data);
-        std::string prefix(g_lock_fs_prefix);
-        prefix += "/";
-        prefix += msg->lock_path;
-        prefix = path_calculator(prefix);
-        if (msg->lock_action == ML_LOCK_FILE) {
-            lock_file(prefix, true /* actually lock */);
-            return 0;
-        } else if (msg->lock_action == ML_UNLOCK_FILE) {
-            unlock_file(prefix);
-            return 0;
-        } else if (msg->lock_action == ML_APPEND_FILE) {
-            const uint64_t path_crc64 = CRC64::ECMA::calc(
-                reinterpret_cast<const uint8_t *>(prefix.c_str()),
-                prefix.length());
-            int fd = 0;
+        try {
+            const auto *msg = static_cast<lock_file_ioctl_msg_t *>(data);
+            std::vector<char> buff(PATH_MAX, 0);
+            std::string path = realpath(msg->lock_path, buff.data());
+            replace_all(path, g_lock_fs_mount_point, g_lock_fs_prefix);
+            const int fd = open(path.c_str(), O_RDWR, S_IREAD | S_IWRITE);
+            AUTO_ASSERT(fd >= 0);
+            struct stat stbuf { };
+            AUTO_ASSERT(fstat(fd, &stbuf) == 0);
 
-            {
-                std::lock_guard<std::mutex> lock(g_fd_tree_mutex);
-                if (const auto it = g_fd_tree.find(path_crc64); it == g_fd_tree.end()) {
-                    if (fd = open(prefix.c_str(), O_RDWR); fd <= 0) {
-                        return (errno == 0 ? -EIO : -errno);
-                    }
-                }
-                else {
-                    fd = it->second.fd;
-                }
+            if (msg->lock_action == ML_LOCK_FILE) {
+                try_lock_and_block_when_trying(stbuf.st_ino, true /* actually lock */);
+                return 0;
+            } else if (msg->lock_action == ML_UNLOCK_FILE) {
+                unlock_by_checksum(stbuf.st_ino);
+                return 0;
+            } else if (msg->lock_action == ML_APPEND_FILE) {
+                const auto n = std::min(msg->content_length, static_cast<uint64_t>(sizeof(msg->content_data)));
+                return write(fd, msg->content_data, n) != n;
             }
-
-            const auto n = std::min(msg->content_length, static_cast<uint64_t>(sizeof(msg->content_data)));
-            return write(fd, msg->content_data, n) != n;
         }
+        ERROR_RPT
     }
 
     return -EINVAL;
@@ -541,7 +454,9 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    g_lock_fs_prefix = fs::current_path().string() + "/" + std::string(argv[1]);
+    char buf [PATH_MAX] = { };
+    g_lock_fs_prefix = realpath(argv[1], buf); // src
+    g_lock_fs_mount_point = realpath(argv[2], buf); // dest
     std::unique_ptr<char*[]> fuse_argv;
     std::vector<std::string> fuse_args;
     if constexpr (DEBUG) {
@@ -552,7 +467,7 @@ int main(int argc, char **argv)
 
     fuse_args.push_back(argv[2]);
     fuse_args.emplace_back("-o");
-    fuse_args.emplace_back("subtype=cfs");
+    fuse_args.emplace_back("subtype=mlfs");
     fuse_args.emplace_back("-o");
     fuse_args.emplace_back("fsname=" + std::string(argv[1]));
 
