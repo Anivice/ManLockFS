@@ -300,7 +300,7 @@ static int fuse_do_ioctl(const char *, const unsigned int cmd, void *,
         try {
             const auto *msg = static_cast<lock_file_ioctl_msg_t *>(data);
             std::vector<char> buff(PATH_MAX, 0);
-            std::string path = realpath(msg->lock_path, buff.data());
+            std::string path = msg->lock_path;
             replace_all(path, g_lock_fs_mount_point, g_lock_fs_prefix);
             const int fd = open(path.c_str(), O_RDWR, S_IREAD | S_IWRITE);
             AUTO_ASSERT(fd >= 0);
