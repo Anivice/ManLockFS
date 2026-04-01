@@ -143,13 +143,6 @@ static int fuse_do_getattr(const char *path, struct stat *stbuf, fuse_file_info 
     return 0;
 }
 
-struct linux_dirent {
-    unsigned long  d_ino;
-    off_t          d_off;
-    unsigned short d_reclen;
-    char           d_name[];
-};
-
 static int fuse_do_readdir(const char *path,
                            void *buffer,
                            const fuse_fill_dir_t filler,
@@ -157,33 +150,12 @@ static int fuse_do_readdir(const char *path,
 {
     std::string prefix(g_lock_fs_prefix);
     prefix += path;
-    std::vector < linux_dirent > dirents;
-    const int fd = open(prefix.c_str(), O_RDONLY | O_DIRECTORY);
-    if (fd < 0) return -errno;
-
-    constexpr int BUF_SIZE = 4096;
-    char buf [BUF_SIZE] = { };
-    for (;;)
-    {
-        const long nread = syscall(SYS_getdents64, fd, buf, BUF_SIZE);
-        if (nread == -1) {
-            close(fd);
-            return -errno;
-        }
-
-        if (nread == 0)
-            break;
-
-        for (size_t bpos = 0; bpos < nread;) {
-            const auto * d = reinterpret_cast<linux_dirent *>(buf + bpos);
-            filler(buffer, d->d_name, nullptr, 0, static_cast<fuse_fill_dir_flags>(0)); // FUSE_FILL_DIR_DEFAULTS = 0 not defined?
-            bpos += d->d_reclen;
-        }
+    for (const auto& entry : fs::directory_iterator(prefix)) {
+        filler(buffer, entry.path().filename().c_str(), nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
     }
 
     filler(buffer, ".", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
     filler(buffer, "..", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
-    close(fd);
     return 0;
 }
 
