@@ -58,7 +58,7 @@ std::condition_variable g_cond_var;
 #define STTR(X) #X
 #define STR(x) STTR(x)
 
-#define AUTO_ASSERT(x) if (!(x)) { throw std::runtime_error("Assertion failed! " #x " at " __FILE__ ":" STR(__LINE__)); }
+#define AUTO_ASSERT(x) if (!(x)) { throw std::runtime_error("Assertion failed! " #x " at " __FILE__ ":" STR(__LINE__) ": " + std::string(std::strerror(errno))); }
 #define ERROR_RPT                                                                       \
     catch (std::exception & e) {                                                        \
         std::cerr << "Error in " << __FUNCTION__ << ":" << e.what() << std::endl;       \
