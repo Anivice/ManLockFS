@@ -10,10 +10,7 @@
 
 struct lock_file_ioctl_msg_t {
     uint64_t lock_action;
-    uint64_t locker_ino;
-    uint64_t content_length;
     char lock_path[256];
-    char content_data[512];
 };
 
 #define MLFS_LOCK   _IOW('M', 0x42, struct lock_file_ioctl_msg_t)

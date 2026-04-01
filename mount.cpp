@@ -23,10 +23,7 @@ namespace fs = std::filesystem;
 
 struct lock_file_ioctl_msg_t {
     uint64_t lock_action;
-    uint64_t locker_ino;
-    uint64_t content_length;
     char lock_path[256];
-    char content_data[512];
 };
 
 #define MLFS_LOCK   _IOW('M', 0x42, struct lock_file_ioctl_msg_t)
@@ -39,8 +36,24 @@ std::string g_lock_fs_mount_point;
 struct fd_lock_state_t {
     int lock_state;
 };
+
+struct file_key_t {
+    dev_t dev;
+    ino_t ino;
+
+    bool operator==(const file_key_t&) const = default;
+};
+
+struct file_key_hash {
+    size_t operator()(const file_key_t& k) const noexcept {
+        return std::hash<uint64_t>{}(
+            (static_cast<uint64_t>(k.dev) << 32) ^ static_cast<uint64_t>(k.ino)
+        );
+    }
+};
+
 std::mutex g_fd_lock_state_mutex;
-std::unordered_map < uint64_t /* path hash */, fd_lock_state_t > g_fd_lock_state;
+std::unordered_map < file_key_t, fd_lock_state_t, file_key_hash > g_fd_lock_state;
 std::condition_variable g_cond_var;
 
 #define STTR(X) #X
@@ -57,7 +70,7 @@ std::condition_variable g_cond_var;
         return (errno == 0 ? -EIO : -errno);                                            \
     }
 
-void try_lock_and_block_when_trying(uint64_t ino, bool do_i_lock)
+void try_lock_and_block_when_trying(const file_key_t ino, const bool do_i_lock)
 {
     std::unique_lock<std::mutex> lk(g_fd_lock_state_mutex);
     g_cond_var.wait(lk, [&] {
@@ -71,20 +84,24 @@ void try_lock_and_block_when_trying(uint64_t ino, bool do_i_lock)
     }
 }
 
-void unlock_by_checksum(const uint64_t checksum)
+void unlock_by_checksum(const file_key_t checksum)
 {
     std::lock_guard lock(g_fd_lock_state_mutex);
     g_fd_lock_state.erase(checksum);
     g_cond_var.notify_all();
 }
 
-uint64_t get_ino(const std::string & path)
+file_key_t get_ino(const std::string & path)
 {
     const int fd = open(path.c_str(), O_RDONLY);
     AUTO_ASSERT(fd >= 0);
-    struct stat stbuf { };
-    AUTO_ASSERT(fstat(fd, &stbuf) == 0);
-    return stbuf.st_ino;
+    struct stat stbuf{};
+    const int rc = fstat(fd, &stbuf);
+    const int saved = errno;
+    close(fd);
+    errno = saved;
+    AUTO_ASSERT(rc == 0);
+    return { .dev = stbuf.st_dev, .ino = stbuf.st_ino };
 }
 
 inline void lock_file(const std::string & path, const bool do_i_lock = false) {
@@ -143,15 +160,17 @@ static int fuse_do_readdir(const char *path,
     prefix += path;
     std::vector < linux_dirent > dirents;
     const int fd = open(prefix.c_str(), O_RDONLY | O_DIRECTORY);
-    if (fd <= 0) return -errno;
+    if (fd < 0) return -errno;
 
     constexpr int BUF_SIZE = 4096;
     char buf [BUF_SIZE] = { };
     for (;;)
     {
         const long nread = syscall(SYS_getdents, fd, buf, BUF_SIZE);
-        if (nread == -1)
+        if (nread == -1) {
+            close(fd);
             return -errno;
+        }
 
         if (nread == 0)
             break;
@@ -165,6 +184,7 @@ static int fuse_do_readdir(const char *path,
 
     filler(buffer, ".", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
     filler(buffer, "..", nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
+    close(fd);
     return 0;
 }
 
@@ -194,10 +214,12 @@ static int fuse_do_create(const char *path, const mode_t mode, fuse_file_info *)
     std::string prefix(g_lock_fs_prefix);
     prefix += path;
     lock_file(prefix);
-    if (open(prefix.c_str(), O_CREAT | O_TRUNC, mode) == -1) {
+    int fd = -1;
+    if ((fd = open(prefix.c_str(), O_CREAT | O_TRUNC, mode)) == -1) {
         return -errno;
     }
 
+    close(fd);
     return 0;
 }
 
@@ -252,7 +274,10 @@ static int fuse_do_utimens(const char *path, const timespec tv[2], fuse_file_inf
     lock_file(prefix);
     const auto fd = open(prefix.c_str(), O_RDWR);
     if (fd == -1) return -errno;
-    return futimens(fd, tv);
+    const int rc = futimens(fd, tv);
+    const int saved = errno;
+    close(fd);
+    return rc == -1 ? -saved : 0;
 }
 
 static int fuse_do_unlink(const char *path)
@@ -310,12 +335,13 @@ static int fuse_do_ioctl(const char *, const unsigned int cmd, void *,
             AUTO_ASSERT(fd >= 0);
             struct stat stbuf { };
             AUTO_ASSERT(fstat(fd, &stbuf) == 0);
+            close(fd);
 
             if (msg->lock_action == ML_LOCK_FILE) {
-                try_lock_and_block_when_trying(stbuf.st_ino, true /* actually lock */);
+                try_lock_and_block_when_trying({ .dev = stbuf.st_dev, .ino = stbuf.st_ino }, true /* actually lock */);
                 return 0;
             } else if (msg->lock_action == ML_UNLOCK_FILE) {
-                unlock_by_checksum(stbuf.st_ino);
+                unlock_by_checksum({ .dev = stbuf.st_dev, .ino = stbuf.st_ino });
                 return 0;
             }
         }
@@ -343,8 +369,11 @@ static int fuse_do_fallocate(const char *path, const int mode, const off_t offse
     prefix += path;
     lock_file(prefix);
     const int fd = open(prefix.c_str(), O_RDWR | O_CREAT);
-    if (fd <= 0) return -errno;
-    return fallocate(fd, mode, offset, length);
+    if (fd < 0) return -errno;
+    const int rc = fallocate(fd, mode, offset, length);
+    const int saved = errno;
+    close(fd);
+    return rc == 0 ? 0 : -saved;
 }
 
 static int fuse_do_readlink(const char *path, char *buffer, const size_t size)
